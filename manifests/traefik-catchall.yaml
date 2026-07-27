@@ -1,0 +1,25 @@
+---
+# traefik-catchall.yaml — Catch-all IngressRoute forwarding to NGINX
+# This is the key to zero-downtime migration:
+#   1. Traefik catches ALL traffic at lowest priority
+#   2. Forwards everything to ingress-nginx's ClusterIP
+#   3. Traffic flow: User → Traefik → NGINX → App
+#   4. As you migrate individual routes, specific rules take priority
+#   5. The catch-all handles anything not yet migrated
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: nginx-catchall
+  namespace: traefik
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: PathPrefix(`/`)
+      kind: Rule
+      priority: 1
+      services:
+        - name: ingress-nginx-controller
+          namespace: ingress-nginx
+          port: 80
+          passHostHeader: true

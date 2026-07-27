@@ -1,0 +1,24 @@
+# nginx-values.yaml — Helm values for ingress-nginx
+# Minimal config for demo purposes
+controller:
+  # Use LoadBalancer for external access on AKS
+  service:
+    type: LoadBalancer
+
+  # Reasonable resource limits for demo
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  # Set as default IngressClass
+  ingressClassResource:
+    name: nginx
+    default: true
+
+  # Enable admission webhook (to demonstrate the security concern)
+  admissionWebhooks:
+    enabled: true

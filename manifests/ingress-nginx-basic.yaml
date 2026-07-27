@@ -1,0 +1,22 @@
+---
+# ingress-nginx-basic.yaml — Vanilla Ingress (S0 tier)
+# No NGINX-specific annotations — just host, path, and service
+# Host matches the Azure DNS record so the app is reachable via DNS
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-basic
+  namespace: demo
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: app.demo.cncf-migration.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-server
+                port:
+                  number: 80

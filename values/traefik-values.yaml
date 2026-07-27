@@ -1,0 +1,70 @@
+# traefik-values.yaml — Helm values for Traefik with NGINX provider
+# Key: kubernetesIngressNGINX provider reads NGINX annotations natively
+
+# Enable the NGINX Ingress compatibility provider
+providers:
+  kubernetesIngress:
+    enabled: true
+  kubernetesCRD:
+    enabled: true
+    allowCrossNamespace: true
+  kubernetesGateway:
+    enabled: true
+  # This is the key provider — reads nginx.ingress.kubernetes.io/* annotations
+  kubernetesIngressNGINX:
+    enabled: true
+    ingressClass: traefik-nginx
+
+# Expose via LoadBalancer for external access on AKS
+service:
+  type: LoadBalancer
+
+# Resource limits for demo
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Do NOT set as default IngressClass (avoid collision with ingress-nginx)
+ingressClass:
+  enabled: true
+  isDefaultClass: false
+
+# Enable Gateway API support
+gateway:
+  enabled: true
+
+# Enable dashboard + API for demo visibility
+ingressRoute:
+  dashboard:
+    enabled: true
+
+# Expose the API/dashboard on port 9000 (default traefik port)
+ports:
+  traefik:
+    port: 9000
+    expose:
+      default: false
+    exposedPort: 9000
+    protocol: TCP
+  web:
+    port: 8000
+    expose:
+      default: true
+    exposedPort: 80
+    protocol: TCP
+
+# Enable API (insecure for demo — NOT for production)
+api:
+  dashboard: true
+  insecure: true
+
+# Logging for demo
+logs:
+  general:
+    level: INFO
+  access:
+    enabled: true

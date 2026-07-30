@@ -1,37 +1,47 @@
 #!/usr/bin/env bash
-# load-generator.sh — LIVE TRAFFIC THAT FOLLOWS DNS CHANGES
+# load-generator.sh — LIVE TRAFFIC THAT FOLLOWS DNS CHANGES (route by route)
 #
-# This is the zero-downtime proof. It queries Azure DNS on every cycle,
-# gets the current A record IPs, and hits them. When DNS changes during
-# the canary cutover, the load generator follows — and never drops.
+# This is the zero-downtime proof. On every cycle it reads the CURRENT Azure DNS
+# A-records for BOTH demo routes and hits each one:
+#
+#   app.<zone>     — vanilla route (S0), no auth
+#   secure.<zone>  — annotated route (S1), HTTP basic auth (demo/demo123)
+#
+# Because both routes are watched independently, you can migrate them ONE AT A
+# TIME: while `app` is being canaried/cut over to Traefik, `secure` keeps hitting
+# NGINX — and neither route ever drops a request.
 #
 # Run this in a SECOND TERMINAL visible to the audience.
 #
 # Usage:
-#   ./load-generator.sh                        # uses defaults
-#   ./load-generator.sh <RESOURCE_GROUP>        # custom RG
+#   ./load-generator.sh                  # uses defaults
+#   ./load-generator.sh <RESOURCE_GROUP> # custom RG
 
-set -euo pipefail
+set -uo pipefail
 
 RG="${1:-${RESOURCE_GROUP:-cncf-nginx-migration-demo}}"
 DNS_ZONE="${DNS_ZONE:-demo.cncf-migration.local}"
-DNS_RECORD="${DNS_RECORD:-app}"
-HOST="app.${DNS_ZONE}"
-INTERVAL=0.5
+INTERVAL="${INTERVAL:-0.5}"
+
+# Routes to exercise: "record|host|curl-extra-args"
+ROUTES=(
+  "app|app.${DNS_ZONE}|"
+  "secure|secure.${DNS_ZONE}|-u demo:demo123"
+)
 
 clear
 echo ""
 echo "  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-echo "  ┃            LIVE TRAFFIC — ZERO DOWNTIME PROOF                    ┃"
+echo "  ┃         LIVE TRAFFIC — ZERO DOWNTIME PROOF (route by route)      ┃"
 echo "  ┃                                                                  ┃"
-echo "  ┃  This queries Azure DNS for the A record on every request.       ┃"
-echo "  ┃  When DNS changes (canary), traffic follows — and never drops.   ┃"
+echo "  ┃  Reads Azure DNS for EACH route every cycle and hits it.         ┃"
+echo "  ┃  Migrate one route at a time — the other never notices.          ┃"
 echo "  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
 echo ""
-echo "  DNS Record:  ${DNS_RECORD}.${DNS_ZONE}"
-echo "  Host header: ${HOST}"
-echo "  Interval:    ${INTERVAL}s"
-echo "  Started:     $(date '+%Y-%m-%d %H:%M:%S')"
+echo "  Zone:      ${DNS_ZONE}"
+echo "  Routes:    app (no auth), secure (basic auth)"
+echo "  Interval:  ${INTERVAL}s"
+echo "  Started:   $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
 
 # ─── Detect controller IPs for labeling ──────────────────────────────────────
@@ -39,82 +49,89 @@ NGINX_IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
   -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
 TRAEFIK_IP=$(kubectl get svc traefik -n traefik \
   -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
-
 echo "  Known IPs:"
-[ -n "${NGINX_IP}" ]  && echo "    NGINX:   ${NGINX_IP}"
+[ -n "${NGINX_IP}" ]   && echo "    NGINX:   ${NGINX_IP}"
 [ -n "${TRAEFIK_IP}" ] && echo "    Traefik: ${TRAEFIK_IP}"
 echo ""
-echo "  ───────────────────────────────────────────────────────────────────"
-printf "  %-10s │ %-6s │ %-7s │ %-16s │ %-10s │ %s\n" \
-  "TIME" "STATUS" "LATENCY" "TARGET IP" "CONTROLLER" "DNS IPs"
-echo "  ───────────────────────────────────────────────────────────────────"
+echo "  ─────────────────────────────────────────────────────────────────────"
+printf "  %-8s │ %-7s │ %-6s │ %-7s │ %-10s │ %s\n" \
+  "TIME" "ROUTE" "STATUS" "LATENCY" "CONTROLLER" "DNS IPs"
+echo "  ─────────────────────────────────────────────────────────────────────"
 
 SUCCESS=0
 FAIL=0
 REQ=0
-LAST_DNS_IPS=""
+# Per-route "last seen DNS" is tracked in indirect scalars (LAST_DNS_app, …)
+# rather than an associative array — macOS ships bash 3.2, which has neither
+# `declare -A` nor associative arrays.
+
+label_ip () { # $1 = ip
+  if   [ "$1" = "${NGINX_IP}" ];   then echo "nginx"
+  elif [ "$1" = "${TRAEFIK_IP}" ]; then echo "traefik"
+  else echo "unknown"; fi
+}
 
 while true; do
   REQ=$((REQ + 1))
   TS=$(date '+%H:%M:%S')
 
-  # ── Query Azure DNS for current A record IPs ──────────────────────────────
-  DNS_IPS=$(az network dns record-set a show \
-    -g "${RG}" -z "${DNS_ZONE}" -n "${DNS_RECORD}" \
-    --query "aRecords[].ipv4Address" -o tsv 2>/dev/null | tr '\n' ' ' | xargs)
+  # ── One DNS call per cycle for ALL records, parsed case-insensitively ──────
+  # Newer az returns ARecords/TTL (PascalCase), older aRecords/ttl — handle both.
+  DNS_JSON=$(az network dns record-set a list -g "${RG}" -z "${DNS_ZONE}" -o json 2>/dev/null || echo "[]")
 
-  if [ -z "${DNS_IPS}" ]; then
-    printf "  \033[33m%-10s │ ---    │ ---     │ %-16s │ %-10s │ DNS EMPTY\033[0m\n" \
-      "${TS}" "---" "---"
-    sleep "${INTERVAL}"
-    continue
-  fi
+  for entry in "${ROUTES[@]}"; do
+    IFS='|' read -r REC HOST EXTRA <<< "${entry}"
 
-  # Show when DNS changes
-  if [ "${DNS_IPS}" != "${LAST_DNS_IPS}" ] && [ -n "${LAST_DNS_IPS}" ]; then
-    echo ""
-    printf "  \033[1;36m  >>> DNS CHANGED: [%s] → [%s] <<<\033[0m\n" "${LAST_DNS_IPS}" "${DNS_IPS}"
-    echo ""
-  fi
-  LAST_DNS_IPS="${DNS_IPS}"
+    DNS_IPS=$(printf '%s' "${DNS_JSON}" | python3 -c "
+import json,sys
+try: data=json.load(sys.stdin)
+except Exception: data=[]
+rec=sys.argv[1]
+for rs in data:
+    if rs.get('name')==rec:
+        arecs=rs.get('ARecords') or rs.get('aRecords') or []
+        print(' '.join(a.get('ipv4Address','') for a in arecs))
+        break
+" "${REC}" 2>/dev/null | xargs)
 
-  # Pick an IP from DNS (round-robin through returned IPs)
-  IP_ARRAY=(${DNS_IPS})
-  IP_COUNT=${#IP_ARRAY[@]}
-  IDX=$(( (REQ - 1) % IP_COUNT ))
-  TARGET_IP="${IP_ARRAY[${IDX}]}"
+    # Detect and announce DNS changes per route (indirect scalar per route)
+    last_var="LAST_DNS_${REC}"
+    eval "prev=\${${last_var}:-}"
+    if [ -n "${DNS_IPS}" ] && [ "${DNS_IPS}" != "${prev}" ] && [ -n "${prev}" ]; then
+      echo ""
+      printf "  \033[1;36m  >>> [%s] DNS CHANGED: [%s] → [%s] <<<\033[0m\n" \
+        "${REC}" "${prev}" "${DNS_IPS}"
+      echo ""
+    fi
+    eval "${last_var}=\"\${DNS_IPS}\""
 
-  # Label the target
-  if [ "${TARGET_IP}" = "${NGINX_IP}" ]; then
-    CTRL_LABEL="nginx"
-  elif [ "${TARGET_IP}" = "${TRAEFIK_IP}" ]; then
-    CTRL_LABEL="traefik"
-  else
-    CTRL_LABEL="unknown"
-  fi
+    if [ -z "${DNS_IPS}" ]; then
+      printf "  \033[33m%-8s │ %-7s │ ---    │ ---     │ %-10s │ DNS EMPTY\033[0m\n" \
+        "${TS}" "${REC}" "---"
+      continue
+    fi
 
-  # ── Hit the app ────────────────────────────────────────────────────────────
-  RESP=$(curl -s -o /dev/null \
-    -w "%{http_code}|%{time_total}" \
-    --connect-timeout 3 \
-    --max-time 5 \
-    -H "Host: ${HOST}" \
-    "http://${TARGET_IP}/" 2>/dev/null || echo "000|0.000")
+    # Round-robin across whatever IPs DNS currently returns
+    IP_ARRAY=(${DNS_IPS})
+    TARGET_IP="${IP_ARRAY[$(( (REQ - 1) % ${#IP_ARRAY[@]} ))]}"
 
-  CODE=$(echo "${RESP}" | cut -d'|' -f1)
-  LAT=$(echo "${RESP}" | cut -d'|' -f2)
+    RESP=$(curl -s -o /dev/null -w "%{http_code}|%{time_total}" \
+      --connect-timeout 3 --max-time 5 ${EXTRA} \
+      -H "Host: ${HOST}" "http://${TARGET_IP}/" 2>/dev/null || echo "000|0.000")
+    CODE="${RESP%%|*}"; LAT="${RESP##*|}"
+    CTRL=$(label_ip "${TARGET_IP}")
+    DNS_DISPLAY=$(echo "${DNS_IPS}" | tr ' ' ',')
 
-  DNS_DISPLAY=$(echo "${DNS_IPS}" | tr ' ' ',')
-
-  if [ "${CODE}" = "200" ]; then
-    SUCCESS=$((SUCCESS + 1))
-    printf "  \033[32m%-10s │ %s    │ %ss │ %-16s │ %-10s │ [%s]  ✓ %d\033[0m\n" \
-      "${TS}" "${CODE}" "${LAT}" "${TARGET_IP}" "${CTRL_LABEL}" "${DNS_DISPLAY}" "${SUCCESS}"
-  else
-    FAIL=$((FAIL + 1))
-    printf "  \033[1;31m%-10s │ %s    │ %ss │ %-16s │ %-10s │ [%s]  ✗ FAIL #%d\033[0m\n" \
-      "${TS}" "${CODE}" "${LAT}" "${TARGET_IP}" "${CTRL_LABEL}" "${DNS_DISPLAY}" "${FAIL}"
-  fi
+    if [ "${CODE}" = "200" ]; then
+      SUCCESS=$((SUCCESS + 1))
+      printf "  \033[32m%-8s │ %-7s │ %s    │ %ss │ %-10s │ [%s] ✓%d\033[0m\n" \
+        "${TS}" "${REC}" "${CODE}" "${LAT}" "${CTRL}" "${DNS_DISPLAY}" "${SUCCESS}"
+    else
+      FAIL=$((FAIL + 1))
+      printf "  \033[1;31m%-8s │ %-7s │ %s    │ %ss │ %-10s │ [%s] ✗ FAIL #%d\033[0m\n" \
+        "${TS}" "${REC}" "${CODE}" "${LAT}" "${CTRL}" "${DNS_DISPLAY}" "${FAIL}"
+    fi
+  done
 
   sleep "${INTERVAL}"
 done

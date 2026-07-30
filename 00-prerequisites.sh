@@ -70,6 +70,14 @@ helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx 2>/dev/nu
 helm repo add traefik https://traefik.github.io/charts 2>/dev/null || true
 helm repo update
 
+# ─── Install Gateway API CRDs ────────────────────────────────────────────────
+# Traefik v3.7's chart no longer ships these, and enabling the Gateway provider
+# without them makes the Traefik install fail. Gateway API is the CNCF-blessed
+# successor to ingress-nginx, so we install the standard channel up front.
+GATEWAY_API_VERSION="${GATEWAY_API_VERSION:-v1.2.0}"
+echo "Installing Gateway API CRDs (${GATEWAY_API_VERSION})..."
+kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+
 echo ""
 echo "=== Prerequisites complete ==="
 echo ""

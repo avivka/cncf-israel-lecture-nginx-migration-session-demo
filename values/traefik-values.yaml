@@ -1,7 +1,9 @@
-# traefik-values.yaml — Helm values for Traefik with NGINX provider
-# Key: kubernetesIngressNGINX provider reads NGINX annotations natively
+# traefik-values.yaml — Helm values for Traefik with the NGINX provider
+# Verified against Traefik Helm chart 41.x (Traefik v3.7).
+# Key: the kubernetesIngressNGINX provider reads nginx.ingress.kubernetes.io/*
+# annotations natively — so Traefik serves your existing NGINX Ingresses as-is.
 
-# Enable the NGINX Ingress compatibility provider
+# ─── Providers ────────────────────────────────────────────────────────────────
 providers:
   kubernetesIngress:
     enabled: true
@@ -10,16 +12,61 @@ providers:
     allowCrossNamespace: true
   kubernetesGateway:
     enabled: true
-  # This is the key provider — reads nginx.ingress.kubernetes.io/* annotations
+  # The star of the show — reads nginx.ingress.kubernetes.io/* annotations.
+  # It watches the SAME "nginx" IngressClass the existing Ingresses already use,
+  # so Traefik picks them up natively and the audience sees real routers appear
+  # in the dashboard. During side-by-side both controllers can read them safely;
+  # actual traffic still flows via DNS + the catch-all until cutover.
   kubernetesIngressNGINX:
     enabled: true
-    ingressClass: traefik-nginx
+    controllerClass: "k8s.io/ingress-nginx"
+    ingressClass: "nginx"
+    watchIngressWithoutClass: false
 
-# Expose via LoadBalancer for external access on AKS
+# ─── Service ──────────────────────────────────────────────────────────────────
+# Expose via LoadBalancer for external access on AKS.
 service:
   type: LoadBalancer
 
-# Resource limits for demo
+# Do NOT set Traefik as the default IngressClass (avoid collision with nginx).
+ingressClass:
+  enabled: true
+  isDefaultClass: false
+
+# ─── Gateway API ──────────────────────────────────────────────────────────────
+gateway:
+  enabled: true
+
+# ─── Dashboard ────────────────────────────────────────────────────────────────
+# The dashboard is served on the internal "traefik" entrypoint via a secure
+# IngressRoute (matchRule PathPrefix(`/dashboard`) || PathPrefix(`/api`)).
+# It is NOT exposed on the LoadBalancer — reach it with a port-forward:
+#   kubectl port-forward -n traefik deploy/traefik 9000:9000
+#   open http://localhost:9000/dashboard/
+api:
+  dashboard: true
+ingressRoute:
+  dashboard:
+    enabled: true
+
+# ─── Ports ────────────────────────────────────────────────────────────────────
+ports:
+  # Internal entrypoint that serves the dashboard/API. Not exposed publicly.
+  traefik:
+    port: 9000
+    expose:
+      default: false
+    exposedPort: 9000
+    protocol: TCP
+  # Public HTTP entrypoint — this is where app traffic and the catch-all live.
+  web:
+    port: 8000
+    expose:
+      default: true
+    exposedPort: 80
+    protocol: TCP
+
+# ─── Resources (demo-sized) ───────────────────────────────────────────────────
 resources:
   requests:
     cpu: 100m
@@ -28,43 +75,8 @@ resources:
     cpu: 500m
     memory: 256Mi
 
-# Do NOT set as default IngressClass (avoid collision with ingress-nginx)
-ingressClass:
+# ─── Logging ──────────────────────────────────────────────────────────────────
+log:
+  level: INFO
+accessLog:
   enabled: true
-  isDefaultClass: false
-
-# Enable Gateway API support
-gateway:
-  enabled: true
-
-# Enable dashboard + API for demo visibility
-ingressRoute:
-  dashboard:
-    enabled: true
-
-# Expose the API/dashboard on port 9000 (default traefik port)
-ports:
-  traefik:
-    port: 9000
-    expose:
-      default: false
-    exposedPort: 9000
-    protocol: TCP
-  web:
-    port: 8000
-    expose:
-      default: true
-    exposedPort: 80
-    protocol: TCP
-
-# Enable API (insecure for demo — NOT for production)
-api:
-  dashboard: true
-  insecure: true
-
-# Logging for demo
-logs:
-  general:
-    level: INFO
-  access:
-    enabled: true

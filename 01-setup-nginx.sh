@@ -69,13 +69,18 @@ kubectl get pods -n demo -l app=echo-server
 echo ""
 
 # ─── Create basic auth secret ───────────────────────────────────────────────
-# htpasswd: demo / demo123
-if ! kubectl get secret basic-auth -n demo &>/dev/null; then
-  echo "Creating basic-auth secret..."
-  kubectl create secret generic basic-auth \
-    --namespace demo \
-    --from-literal=auth='demo:$apr1$H6uskkkW$IgXLP6ewTrSuBkTrqE8wj/'
-fi
+# Credentials: demo / demo123
+# Generate the apr1 (Apache MD5) hash at runtime so it always matches the
+# password — a hardcoded hash drifted from the password before and produced
+# 401s even with correct creds. Idempotent via apply.
+echo "Creating basic-auth secret (demo / demo123)..."
+AUTH_USER="${AUTH_USER:-demo}"
+AUTH_PASS="${AUTH_PASS:-demo123}"
+AUTH_HASH="$(openssl passwd -apr1 "${AUTH_PASS}")"
+kubectl create secret generic basic-auth \
+  --namespace demo \
+  --from-literal=auth="${AUTH_USER}:${AUTH_HASH}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
 # ─── Deploy Ingress resources ───────────────────────────────────────────────
 echo "Deploying Ingress resources..."
@@ -93,27 +98,23 @@ if ! az network dns zone show -g "${RESOURCE_GROUP}" -n "${DNS_ZONE}" &>/dev/nul
   az network dns zone create -g "${RESOURCE_GROUP}" -n "${DNS_ZONE}" --output none
 fi
 
-# Create A record for the main app: app.demo.cncf-migration.local → NGINX IP
-echo "Creating DNS: app.${DNS_ZONE} → ${NGINX_IP} (TTL=30s)"
-az network dns record-set a delete \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "app" --yes 2>/dev/null || true
-az network dns record-set a add-record \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "app" \
-  --ipv4-address "${NGINX_IP}" --output none
-az network dns record-set a update \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "app" \
-  --set ttl=30 --output none
-
-# Create A record for the annotated app: secure.demo.cncf-migration.local → NGINX IP
-echo "Creating DNS: secure.${DNS_ZONE} → ${NGINX_IP} (TTL=30s)"
-az network dns record-set a delete \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "secure" --yes 2>/dev/null || true
-az network dns record-set a add-record \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "secure" \
-  --ipv4-address "${NGINX_IP}" --output none
-az network dns record-set a update \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "secure" \
-  --set ttl=30 --output none
+# Create A records → NGINX, TTL lowered to 30s (canary-ready).
+# Order matters: `add-record` creates-or-updates the record-set and resets TTL
+# to the 3600s default, so we lower TTL *after* adding the IP, not before.
+# The `--set TTL=30` (with a lowercase fallback) covers both az/DNS API model
+# casings — newer az exposes the property as `TTL` (PascalCase), older as `ttl`.
+for rec in app secure; do
+  echo "Creating DNS: ${rec}.${DNS_ZONE} → ${NGINX_IP} (TTL=30s)"
+  az network dns record-set a delete \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" --yes 2>/dev/null || true
+  az network dns record-set a add-record \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" \
+    --ipv4-address "${NGINX_IP}" --output none
+  az network dns record-set a update \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" --set TTL=30 --output none 2>/dev/null || \
+  az network dns record-set a update \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" --set ttl=30 --output none
+done
 
 # ─── Verify the app is reachable ─────────────────────────────────────────────
 echo ""

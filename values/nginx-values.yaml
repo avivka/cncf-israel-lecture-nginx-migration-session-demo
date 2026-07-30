@@ -4,6 +4,13 @@ controller:
   # Use LoadBalancer for external access on AKS
   service:
     type: LoadBalancer
+    annotations:
+      # AKS gotcha: nginx returns 404 for "/", so the default Azure LB HTTP
+      # health probe (path "/") marks the backend UNHEALTHY and the public IP
+      # goes dark (connections time out). Point the probe at /healthz, which the
+      # controller serves 200 on the data port. Without this the demo baseline
+      # (load generator hitting the NGINX public IP) fails.
+      service.beta.kubernetes.io/azure-load-balancer-health-probe-request-path: /healthz
 
   # Reasonable resource limits for demo
   resources:

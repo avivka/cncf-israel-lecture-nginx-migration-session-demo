@@ -102,7 +102,11 @@ echo ""
 pkill -f 'port-forward.*traefik.*9000' 2>/dev/null || true
 sleep 1
 
-kubectl port-forward -n traefik svc/traefik 9000:9000 &>/dev/null &
+# Port-forward the DEPLOYMENT, not the Service: the dashboard lives on the
+# internal "traefik" entrypoint (containerPort 9000), which is deliberately NOT
+# exposed on the LoadBalancer Service — so `svc/traefik 9000` has no such port
+# and the forward fails. The pod always listens on 9000.
+kubectl port-forward -n traefik deploy/traefik 9000:9000 &>/dev/null &
 DASHBOARD_PID=$!
 echo "  Dashboard port-forward PID: ${DASHBOARD_PID}"
 sleep 2

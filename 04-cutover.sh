@@ -1,37 +1,30 @@
 #!/usr/bin/env bash
-# 04-cutover.sh — DNS CANARY SWITCH: Zero-Downtime Migration
+# 04-cutover.sh — ROUTE-BY-ROUTE DNS CANARY: Zero-Downtime Migration
 #
-# This is the core of the demo. The pattern (from a real customer migration):
+# This is the core of the demo. We migrate ONE ROUTE AT A TIME from NGINX to
+# Traefik, purely by changing DNS — gradually, and with zero downtime.
 #
-#   BEFORE (done in 01-setup):
-#     - DNS TTL lowered to 30s (in prod, do this days before)
-#     - DNS A record → NGINX IP only
+# For EACH route (app first, then secure):
 #
-#   PHASE 1: Deploy catch-all (done in 03-deploy-traefik):
-#     - Traefik IngressRoute catches all traffic → forwards to NGINX
-#     - Both IPs serve 200 — Traefik via catch-all, NGINX directly
+#   START:   DNS → [NGINX]              (route served by NGINX)
+#   CANARY:  DNS → [NGINX, TRAEFIK]     (add Traefik IP → ~50/50 round-robin)
+#   CUTOVER: DNS → [TRAEFIK]            (remove NGINX IP → 100% Traefik)
 #
-#   PHASE 2: DNS CANARY (this script)
-#     - Add Traefik IP to DNS → round-robin 50/50
-#     - Load generator shows: both IPs green, zero drops
+# The safety net that makes every step return 200:
+#   - Traefik reads the SAME nginx Ingresses natively (kubernetesIngressNGINX)
+#   - AND a catch-all IngressRoute forwards anything else Traefik → NGINX → App
 #
-#   PHASE 3: COMPLETE CUTOVER (this script)
-#     - Remove NGINX IP from DNS → 100% Traefik
-#     - Load generator shows: Traefik only, zero drops
-#
-#   PHASE 4: RAISE TTL (this script)
-#     - TTL back to 300s (production value)
-#     - NGINX stays running 24-48h for cache drain
-#
-# The load generator in the second terminal is querying Azure DNS
-# on every request — it FOLLOWS the DNS changes in real time.
+# The load generator in the second terminal queries Azure DNS for BOTH routes on
+# every request. While `app` is migrating, `secure` keeps hitting NGINX untouched
+# — proving routes move independently and nothing drops.
 
 set -euo pipefail
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 RESOURCE_GROUP="${RESOURCE_GROUP:-cncf-nginx-migration-demo}"
 DNS_ZONE="${DNS_ZONE:-demo.cncf-migration.local}"
-DNS_RECORD="${DNS_RECORD:-app}"
+# Routes to migrate, in order. Override with e.g. ROUTES="app" for a single route.
+ROUTES="${ROUTES:-app secure}"
 
 # ─── Get IPs ─────────────────────────────────────────────────────────────────
 NGINX_IP=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
@@ -46,162 +39,115 @@ if [ -z "${NGINX_IP}" ] || [ -z "${TRAEFIK_IP}" ]; then
   exit 1
 fi
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+# Print a record's TTL + IPs, handling both az/DNS API casings (ARecords/TTL vs
+# aRecords/ttl).
+show_dns () {
+  local rec="$1"
+  az network dns record-set a show \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" \
+    --query "{TTL: TTL || ttl, IPs: ARecords[].ipv4Address || aRecords[].ipv4Address}" \
+    -o json 2>/dev/null | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(f'      TTL: {d[\"TTL\"]}s')
+for ip in (d['IPs'] or []):
+    print(f'      A:   {ip}')
+" 2>/dev/null || echo "      ${rec} (unavailable)"
+}
+
+# Migrate a single route: canary (add Traefik) then cutover (remove NGINX).
+migrate_route () {
+  local rec="$1"
+  echo ""
+  echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "  ROUTE: ${rec}.${DNS_ZONE}"
+  echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  echo "  Current DNS (NGINX only):"
+  show_dns "${rec}"
+  echo ""
+  echo "  >>> Load generator: '${rec}' is all green via NGINX. <<<"
+  echo ""
+  read -rp "  Press Enter to CANARY '${rec}' (add Traefik IP → 50/50)..."
+  echo ""
+
+  # ── CANARY: add Traefik IP ────────────────────────────────────────────────
+  az network dns record-set a add-record \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" \
+    --ipv4-address "${TRAEFIK_IP}" --output none
+  echo "  Canary live — '${rec}' now resolves to BOTH IPs (round-robin):"
+  show_dns "${rec}"
+  echo ""
+  echo "  Both return 200: NGINX directly, Traefik natively (+ catch-all)."
+  echo "  >>> Load generator: '${rec}' DNS CHANGED, still all green. <<<"
+  echo ""
+  read -rp "  Press Enter to CUT OVER '${rec}' (remove NGINX IP → 100% Traefik)..."
+  echo ""
+
+  # ── CUTOVER: remove NGINX IP ──────────────────────────────────────────────
+  az network dns record-set a remove-record \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" \
+    --ipv4-address "${NGINX_IP}" --output none
+  echo "  '${rec}' now points to Traefik ONLY:"
+  show_dns "${rec}"
+  echo ""
+  echo "  >>> Load generator: '${rec}' DNS CHANGED again, STILL all green. <<<"
+  echo "  '${rec}' is migrated. (Any other route is untouched — see the load gen.)"
+  echo ""
+}
+
+# ─── Banner ──────────────────────────────────────────────────────────────────
 echo ""
 echo "  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-echo "  ┃           DNS CANARY CUTOVER — ZERO DOWNTIME                     ┃"
+echo "  ┃      ROUTE-BY-ROUTE DNS CANARY CUTOVER — ZERO DOWNTIME           ┃"
 echo "  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
 echo ""
 echo "  NGINX IP:   ${NGINX_IP}"
 echo "  Traefik IP: ${TRAEFIK_IP}"
-echo "  DNS:        ${DNS_RECORD}.${DNS_ZONE}"
+echo "  Routes:     ${ROUTES}   (migrated one at a time)"
+echo ""
+echo "  DNS TTL is already 30s (pre-lowered in step 01 — in prod, do this days"
+echo "  ahead). The catch-all + native provider mean every path serves 200."
 echo ""
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 1: Show current state
-# ══════════════════════════════════════════════════════════════════════════════
-echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  CURRENT STATE"
-echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "  DNS points to NGINX only. TTL is 30s (pre-lowered)."
-echo "  In production, you lower TTL days before the cutover."
-echo ""
-echo "  Current DNS:"
-az network dns record-set a show \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${DNS_RECORD}" \
-  --query "{TTL: ttl, IPs: aRecords[].ipv4Address}" -o json 2>/dev/null | \
-  python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-print(f'    TTL: {d[\"TTL\"]}s')
-for ip in d['IPs']:
-    print(f'    A:   {ip}')
-" 2>/dev/null || echo "    ${DNS_RECORD} → ${NGINX_IP} (TTL=30)"
-echo ""
-echo "  The catch-all IngressRoute is already deployed (step 03)."
-echo "  Traefik forwards all traffic → NGINX. Both IPs serve 200."
-echo ""
-echo "  >>> Check the load generator — all green. <<<"
-echo ""
+# ─── Migrate each route independently ────────────────────────────────────────
+for rec in ${ROUTES}; do
+  migrate_route "${rec}"
+done
 
-read -rp "  Press Enter to start DNS canary (add Traefik IP)..."
-echo ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: DNS CANARY — Add Traefik IP (50/50 round-robin)
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Raise TTL back to production on all migrated routes ──────────────────────
 echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  PHASE 2: DNS CANARY — Adding Traefik IP"
+echo "  FINALIZE: raise TTL back to production (300s)"
 echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
-echo "  Adding ${TRAEFIK_IP} to the A record..."
+read -rp "  Press Enter to raise TTL to 300s on all routes..."
 echo ""
+for rec in ${ROUTES}; do
+  # PascalCase first (newer az/DNS model), fall back to lowercase.
+  az network dns record-set a update \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" --set TTL=300 --output none 2>/dev/null || \
+  az network dns record-set a update \
+    -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${rec}" --set ttl=300 --output none
+  echo "  ${rec}.${DNS_ZONE}:"
+  show_dns "${rec}"
+done
 
-az network dns record-set a add-record \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${DNS_RECORD}" \
-  --ipv4-address "${TRAEFIK_IP}" --output none
-
-echo "  DNS now has TWO A records (round-robin):"
-az network dns record-set a show \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${DNS_RECORD}" \
-  --query "{TTL: ttl, IPs: aRecords[].ipv4Address}" -o json 2>/dev/null | \
-  python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-print(f'    TTL: {d[\"TTL\"]}s')
-for ip in d['IPs']:
-    print(f'    A:   {ip}')
-" 2>/dev/null || echo "    ${NGINX_IP} + ${TRAEFIK_IP}"
-echo ""
-echo "  Clients now resolve to EITHER IP — 50/50 canary."
-echo "  Both return 200:"
-echo "    - NGINX handles traffic directly"
-echo "    - Traefik handles traffic via catch-all → NGINX → App"
-echo ""
-echo "  >>> Look at the load generator — DNS CHANGED, still all green. <<<"
-echo ""
-
-read -rp "  Press Enter to complete cutover (remove NGINX IP)..."
-echo ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 3: COMPLETE CUTOVER — Remove NGINX IP (100% Traefik)
-# ══════════════════════════════════════════════════════════════════════════════
-echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  PHASE 3: COMPLETE CUTOVER — Removing NGINX IP"
-echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "  Removing ${NGINX_IP} from DNS..."
-echo ""
-
-az network dns record-set a remove-record \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${DNS_RECORD}" \
-  --ipv4-address "${NGINX_IP}" --output none
-
-echo "  DNS now points to Traefik ONLY:"
-az network dns record-set a show \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${DNS_RECORD}" \
-  --query "{TTL: ttl, IPs: aRecords[].ipv4Address}" -o json 2>/dev/null | \
-  python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-print(f'    TTL: {d[\"TTL\"]}s')
-for ip in d['IPs']:
-    print(f'    A:   {ip}')
-" 2>/dev/null || echo "    ${TRAEFIK_IP} only"
-echo ""
-echo "  100% of new DNS lookups → Traefik."
-echo "  Old cached entries (max 30s) may still hit NGINX — that's fine,"
-echo "  NGINX is still running."
-echo ""
-echo "  >>> Load generator: DNS CHANGED again, STILL all green. <<<"
-echo ""
-
-read -rp "  Press Enter to raise TTL back to production..."
-echo ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 4: RAISE TTL — Back to production value
-# ══════════════════════════════════════════════════════════════════════════════
-echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  PHASE 4: RAISE TTL — Back to production (300s)"
-echo "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
-az network dns record-set a update \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${DNS_RECORD}" \
-  --set ttl=300 --output none
-
-echo "  Final DNS state:"
-az network dns record-set a show \
-  -g "${RESOURCE_GROUP}" -z "${DNS_ZONE}" -n "${DNS_RECORD}" \
-  --query "{TTL: ttl, IPs: aRecords[].ipv4Address}" -o json 2>/dev/null | \
-  python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-print(f'    TTL: {d[\"TTL\"]}s')
-for ip in d['IPs']:
-    print(f'    A:   {ip}')
-" 2>/dev/null || echo "    ${TRAEFIK_IP} (TTL=300)"
-
-echo ""
 echo ""
 echo "  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
 echo "  ┃                    MIGRATION COMPLETE                            ┃"
 echo "  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
 echo ""
-echo "  What just happened (zero downtime throughout):"
+echo "  What just happened — one route at a time, zero downtime throughout:"
 echo ""
-echo "    1. TTL pre-lowered to 30s (done before cutover window)"
-echo "    2. Traefik deployed with catch-all → NGINX (safety net)"
-echo "    3. DNS canary: added Traefik IP (50/50 round-robin)"
-echo "       → Load generator showed ZERO drops"
-echo "    4. Removed NGINX IP (100% Traefik)"
-echo "       → Load generator showed ZERO drops"
-echo "    5. Raised TTL back to 300s"
+echo "    For each route:  [NGINX] → [NGINX, TRAEFIK] → [TRAEFIK]"
+echo "      • Canary added Traefik IP (50/50)   → load gen: zero drops"
+echo "      • Cutover removed NGINX IP (100%)   → load gen: zero drops"
+echo "      • The OTHER route stayed on NGINX until its own turn"
+echo "    Finally raised TTL back to 300s."
 echo ""
 echo "  In production, next steps:"
 echo "    - Keep NGINX running 24-48h (DNS cache drain)"
-echo "    - Monitor Traefik dashboard for errors"
+echo "    - Watch the Traefik dashboard for errors"
 echo "    - Then: helm uninstall ingress-nginx -n ingress-nginx"
 echo ""
